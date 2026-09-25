@@ -4,7 +4,7 @@ from stable_baselines3 import PPO
 def create_agent(env):
 
     model = PPO(
-        "MlpPolicy",
+        "MultiInputPolicy",
         env,
         learning_rate=0.0003,
         gamma=0.99,
