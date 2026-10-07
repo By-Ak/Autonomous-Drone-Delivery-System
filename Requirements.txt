@@ -1,6 +1,0 @@
-gymnasium
-stable_baselines3
-torch
-pybullet
-numpy
-matplotlib
