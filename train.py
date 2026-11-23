@@ -1,9 +1,14 @@
 """
 train.py - train the delivery drone with PPO (Stable-Baselines3)
 
-    python train.py                       # 3M steps, 8 parallel envs
+    python train.py                       # 5M steps, 8 parallel envs
     python train.py --timesteps 500000 --n-envs 4
-    python train.py --resume models/ppo_drone_final.zip
+    python train.py --resume models/ppo_drone_final.zip --start-difficulty 1.0
+
+Notes on --resume (e.g. fine-tuning after the environment changed):
+  - the curriculum starts again from --start-difficulty (default 0.0), so pass
+    --start-difficulty 1.0 (or --no-curriculum) to continue at full difficulty;
+  - the reward normaliser (vecnormalize.pkl) is NOT loaded, it starts fresh.
 """
 import argparse
 import os
@@ -22,6 +27,8 @@ from city_env import CityDroneEnv, RewardConfig
 GAMMA = RewardConfig().gamma    # shaping and PPO must use the same gamma
 TRAIN_POOL = (0, 1000)         # cities used for training
 EVAL_POOL = (10000, 10100)     # held-out cities, never seen in training
+# For the final numbers you report, test on a THIRD pool (e.g. 20000-20100): best_model was
+# picked using EVAL_POOL, so its score on EVAL_POOL is slightly optimistic.
 
 
 def lr_schedule(lr_start, lr_end):
@@ -33,6 +40,7 @@ def lr_schedule(lr_start, lr_end):
 def make_env(pool=TRAIN_POOL, difficulty=1.0, mix=False):
     def _init():
         # layout_seed=None -> a fresh random city every episode
+        # (no render_mode -> PyBullet runs in DIRECT mode: no window, and no building windows)
         return Monitor(CityDroneEnv(layout_seed=None, layout_pool=pool, regen_every=1,
                                     difficulty=difficulty, difficulty_mix=mix))
     return _init
@@ -48,6 +56,8 @@ class CurriculumCallback(BaseCallback):
         super().__init__()
         self.d, self.step_size = start, step
         self.advance_at, self.level_steps = advance_at, level_steps
+        # last `window` (48) finished episodes at the current cap; the level can only advance on
+        # completion once this is full, so one lucky episode can't trigger it
         self.window = deque(maxlen=window)       # per-episode fraction of deliveries completed
         self.level_start = 0
 
@@ -101,6 +111,7 @@ class OutcomeCallback(BaseCallback):
         return True
 
     def _on_rollout_end(self):
+        # fractions are per rollout (all episodes that ended since the last update)
         total = sum(self.counts.values())
         if total:
             for k in ("success", "crash", "battery_dead", "out_of_bounds", "stalled", "timeout"):
@@ -123,7 +134,9 @@ def main():
                     help="learning-rate floor; set equal to --lr for a constant rate")
     ap.add_argument("--n-envs", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--resume", type=str, default=None)
+    ap.add_argument("--resume", type=str, default=None,
+                    help="continue from a saved model; the curriculum restarts from "
+                         "--start-difficulty and the reward normaliser starts fresh")
     ap.add_argument("--no-curriculum", action="store_true",
                     help="train at full difficulty from the start")
     ap.add_argument("--start-difficulty", type=float, default=0.0)
@@ -136,13 +149,14 @@ def main():
     os.makedirs("models", exist_ok=True)
     os.makedirs("logs", exist_ok=True)
 
-    VecCls = SubprocVecEnv if args.n_envs > 1 else DummyVecEnv
+    VecCls = SubprocVecEnv if args.n_envs > 1 else DummyVecEnv     # parallel processes vs one process
     start_d = 1.0 if args.no_curriculum else args.start_difficulty
     venv = VecCls([make_env(TRAIN_POOL, start_d, mix=not args.no_curriculum) for _ in range(args.n_envs)])
     # Observations are already scaled to [-1, 1]; normalise only the reward.
     venv = VecNormalize(venv, norm_obs=False, norm_reward=True, gamma=GAMMA)
 
     if args.resume:
+        # learning_rate is overridden so a resumed run uses the schedule given on THIS command line
         model = PPO.load(args.resume, env=venv, tensorboard_log="logs",
                          custom_objects={"learning_rate": lr_schedule(args.lr, args.lr_final)})
     else:
@@ -164,10 +178,14 @@ def main():
             verbose=1,
         )
 
-    # Held-out evaluation on cities the agent never trains on
+    # Held-out evaluation on cities the agent never trains on (always full difficulty)
     eval_env = VecNormalize(DummyVecEnv([make_env(EVAL_POOL)]),
                             training=False, norm_obs=False, norm_reward=False)
     callbacks = [
+        # eval_freq / save_freq count calls to the vec-env's step(), and each call advances
+        # n_envs timesteps, so dividing by n_envs gives roughly every 100k / 200k timesteps.
+        # n_eval_episodes=20 is a small sample: best_model can be a lucky pick, so re-evaluate
+        # it on 100+ episodes (ideally on a third city pool) before quoting numbers.
         EvalCallback(eval_env, n_eval_episodes=20, deterministic=True,
                      eval_freq=max(100_000 // args.n_envs, 1),
                      best_model_save_path="models/best", log_path="logs/eval"),
@@ -179,9 +197,9 @@ def main():
         callbacks.append(CurriculumCallback(start=start_d, advance_at=args.advance_at,
                                             level_steps=args.level_steps))
     model.learn(total_timesteps=args.timesteps, callback=callbacks,
-                reset_num_timesteps=not args.resume)
+                reset_num_timesteps=not args.resume)    # keep the step counter when resuming
     model.save("models/ppo_drone_final")
-    venv.save("models/vecnormalize.pkl")
+    venv.save("models/vecnormalize.pkl")     # only needed to resume training; inference doesn't use it
     venv.close()
     print("Saved models/ppo_drone_final.zip")
 
